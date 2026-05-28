@@ -29,6 +29,8 @@ Violation of these terms constitutes copyright infringement.
 -- Pack layout:
 --   sider/content/font-server/<Pack>/common/menu/font/pes_fnt.bin
 --   sider/content/font-server/<Pack>/<locale>/menu/font/pes_fnt.bin
+--   sider/content/font-server/<Pack>/4k/common/menu/font/pes_fnt.bin   (4K override)
+--   sider/content/font-server/<Pack>/4k/<locale>/menu/font/pes_fnt.bin  (4K override)
 --
 -- map.txt: <tournament_id>, <pack_name>
 
@@ -57,7 +59,10 @@ local VERSIONS = {
         mem_free           = 0x140227930,
         font_replace       = 0x140E2D270,
         font_resolve       = 0x140E2CFA0,
-        lang_id            = 0x1434FCE64
+        lang_id            = 0x1434FCE64,
+        is_4k_check        = 0x1414A97C0,
+        gmc_create_ret     = 0x140A48831,
+        gmc_destroy_ret    = 0x140A48909
     },
     { -- 1.07.02
         tid_setter         = 0x1414C76F0,
@@ -66,7 +71,10 @@ local VERSIONS = {
         mem_free           = 0x140227A90,
         font_replace       = 0x140E2F620,
         font_resolve       = 0x140E2F350,
-        lang_id            = 0x14350AF14
+        lang_id            = 0x14350AF14,
+        is_4k_check        = 0x1414AF270,
+        gmc_create_ret     = 0x140A48E21,
+        gmc_destroy_ret    = 0x140A48EF9
     }
 }
 
@@ -99,6 +107,9 @@ local tid_addr         = nil
 local pending_pack     = nil
 local pending_restore  = false
 local manual_override  = false
+local use_matchMenu    = true
+local is_4k            = false
+local no_4k_scale      = false
 
 local function trim(s) return s:match("^%s*(.-)%s*$") end
 local function exists(p) local f = io.open(p,"rb"); if f then f:close(); return true end; return false end
@@ -133,6 +144,10 @@ local active_locale = nil
 local function pack_font_path(pack, subdir, fname)
     if subdir == "xxx" and active_locale then
         subdir = active_locale
+    end
+    if is_4k and not no_4k_scale then
+        local path_4k = absp(string.format("%s\\%s\\4k\\%s\\menu\\font\\%s", CONTENT_ROOT, pack, subdir, fname))
+        if exists(path_4k) then return path_4k end
     end
     return absp(string.format("%s\\%s\\%s\\menu\\font\\%s", CONTENT_ROOT, pack, subdir, fname))
 end
@@ -188,6 +203,29 @@ local function load_map()
     table.sort(all_packs)
     for i, name in ipairs(all_packs) do pack_idx[name] = i end
     log(string.format("[FontServer] %d pack(s): %s", #all_packs, table.concat(all_packs, ", ")))
+end
+
+local function load_config(ctx)
+    local t = {}
+    for _, dir in ipairs({ctx.sider_dir, ctx.sider_dir .. "\\modules"}) do
+        local path = dir .. "\\font_server.ini"
+        local f = io.open(path, "r")
+        if f then
+            log(string.format("[FontServer] config: %s", path))
+            for line in f:lines() do
+                line = line:gsub("^[\xEF\xBB\xBF]+", "")
+                line = line:gsub("^[%s%z\xA0]+", ""):gsub("[%s%z\xA0]+$", "")
+                local k, v = line:match("^([%w_]+)%s*=%s*([-%w%d.]+)")
+                if k and v then t[k] = v end
+            end
+            f:close()
+            break
+        end
+    end
+    if t.use_matchMenu then use_matchMenu = t.use_matchMenu == "1" end
+    if t.no_4k_scale then no_4k_scale = t.no_4k_scale == "1" end
+    log(string.format("[FontServer] config: use_matchMenu=%s no_4k_scale=%s",
+        tostring(use_matchMenu), tostring(no_4k_scale)))
 end
 
 local mem_free_fn = nil
@@ -316,7 +354,7 @@ local function setup()
     end
     if not ver then log("[FontServer] version not detected"); return end
 
-    addr.glyph_cache     = ver.glyph_cache
+    addr.glyph_cache = ver.glyph_cache
 
     -- resolve font ID -> filename mapping
     if ver.lang_id then
@@ -337,11 +375,73 @@ local function setup()
         font_resolve_fn = ffi.cast("void* (*)(unsigned int)",
             ffi.cast("void*", ffi.cast("uint64_t", ver.font_resolve)))
     end
+
+    if ver.is_4k_check then
+        local check_fn = ffi.cast("bool (*)()",
+            ffi.cast("void*", ffi.cast("uint64_t", ver.is_4k_check)))
+        is_4k = check_fn() ~= 0
+        if is_4k and no_4k_scale then
+            -- patch is_4k_check to always return false and clear fonts
+            memory.write(ver.is_4k_check, "\x31\xC0\xC3")
+            flush_glyph_cache()
+            log("[FontServer] 4K: patched (no_4k_scale)")
+        else
+            log(string.format("[FontServer] 4K: %s", tostring(is_4k)))
+        end
+    end
+
     log("[FontServer] version matched")
 
-    -- tid hook
+    -- helpers
     local p64 = function(a) return memory.pack("u64", a) end
     local p32 = function(a) return memory.pack("i32", a) end
+
+    -- gmc hooks
+    if ver.gmc_create_ret and ver.gmc_destroy_ret then
+        local cave_ptr = alloc_near(ffi.cast("void*",ffi.cast("uint64_t", ver.gmc_create_ret)), 128)
+        if not cave_ptr then
+            log("[FontServer] gmc hooks: VirtualAlloc failed")
+        else
+            local cave = ptr_to_num(cave_ptr)
+            addr.reapply_flag = cave + 64
+            addr.restore_flag = cave + 65
+            memory.write(addr.reapply_flag, "\x00")
+            memory.write(addr.restore_flag, "\x00")
+
+            -- Hook gmc_destroy_ret
+            local hook_destroy = table.concat({
+                "\x50",                              -- push rax
+                "\x48\xB8", p64(addr.restore_flag),  -- movabs rax, restore_flag
+                "\xC6\x00\x01",                      -- mov byte [rax], 1
+                "\x58",                              -- pop rax
+                "\x48\x83\xC4\x28",                  -- add rsp, 28h
+                "\xC3"                               -- retn
+            })
+            memory.write(cave, hook_destroy)
+            memory.write(ver.gmc_destroy_ret, "\xE9" .. p32(cave - (ver.gmc_destroy_ret + 5)))
+
+            -- Hook gmc_create_ret
+            local cave2 = cave + 32
+            local hook_create = table.concat({
+                "\x50",                              -- push rax
+                "\x48\xB8", p64(addr.reapply_flag),  -- movabs rax, reapply_flag
+                "\xC6\x00\x01",                      -- mov byte [rax], 1
+                "\x58",                              -- pop rax
+                "\x48\x81\xC4\x90\x00\x00\x00",      -- add rsp, 90h
+                "\x5F",                              -- pop rdi
+                "\x5E",                              -- pop rsi
+                "\x5D",                              -- pop rbp
+                "\xC3"                               -- retn
+            })
+            memory.write(cave2, hook_create)
+            memory.write(ver.gmc_create_ret, "\xE9" .. p32(cave2 - (ver.gmc_create_ret + 5)) .. "\x90\x90")
+
+            log(string.format("[FontServer] gmc hooks: cave=0x%X create=0x%X destroy=0x%X",
+                cave, ver.gmc_create_ret, ver.gmc_destroy_ret))
+        end
+    end
+
+    -- tid hook
 
     local cave_ptr = alloc_near(ffi.cast("void*",ffi.cast("uint64_t", ver.tid_setter)), 64)
     if not cave_ptr then log("[FontServer] VirtualAlloc failed"); return end
@@ -386,7 +486,7 @@ local function do_switch(pack)
 end
 
 function m.make_key(ctx, filename)
-    if not manual_override and filename:find("matchMenu") then
+    if use_matchMenu and not manual_override and filename:find("matchMenu") then
         local tid = get_tournament_id(ctx)
         if tid then
             local pack = t2pack[tid]
@@ -398,6 +498,36 @@ end
 -- display_frame: deferred switch + reload queue
 
 function m.display_frame(ctx)
+    if addr.reapply_flag then
+        local flag = tonumber(memory.unpack("u8", memory.read(addr.reapply_flag, 1)))
+        if flag ~= 0 then
+            memory.write(addr.reapply_flag, "\x00")
+            if active_pack then
+                log(string.format("[FontServer] reapplying '%s'", active_pack))
+                do_font_switch(active_pack)
+            elseif not manual_override then
+                local tid = get_tournament_id(ctx)
+                if tid then
+                    local pack = t2pack[tid]
+                    if pack then
+                        active_pack = pack
+                        log(string.format("[FontServer] match start -> '%s' (tid=%d)", pack, tid))
+                        do_font_switch(pack)
+                    end
+                end
+            end
+        end
+    end
+
+    if addr.restore_flag then
+        local flag = tonumber(memory.unpack("u8", memory.read(addr.restore_flag, 1)))
+        if flag ~= 0 and active_pack and not manual_override then
+            memory.write(addr.restore_flag, "\x00")
+            log("[FontServer] restoring fonts")
+            pending_restore = true
+        end
+    end
+
     if pending_restore then
         pending_restore = false
         active_pack = nil
@@ -414,15 +544,21 @@ end
 
 -- events
 
-function m.set_teams(ctx, home, away)
-    if manual_override then return end
-    local tid = get_tournament_id(ctx)
-    if not tid then return end
-    local pack = t2pack[tid]
-    if pack and pack ~= active_pack then do_switch(pack) end
+function m.context_reset(ctx)
+    if active_pack and not manual_override then
+        pending_pack = nil
+        pending_restore = true
+    end
 end
 
 function m.overlay_on(ctx)
+    if addr.reapply_flag and addr.restore_flag then
+        ctx.overlay:add_line(string.format("reapply_flag: 0x%X = %d", addr.reapply_flag,
+            tonumber(memory.unpack("u8", memory.read(addr.reapply_flag, 1)))))
+        ctx.overlay:add_line(string.format("restore_flag: 0x%X = %d", addr.restore_flag,
+            tonumber(memory.unpack("u8", memory.read(addr.restore_flag, 1)))))
+    end
+    ctx.overlay:add_line(string.format("active_pack: %s", tostring(active_pack)))
     local tid = get_tournament_id(ctx)
     local label = active_pack or "default"
     return string.format("FontServer | %s | tid=%s | %s | PgUp/Dn End=auto",
@@ -465,11 +601,12 @@ function m.init(ctx)
     end
 
     load_map()
+    load_config(ctx)
     setup()
 
     ctx.register("livecpk_make_key",     m.make_key)
     ctx.register("display_frame",        m.display_frame)
-    ctx.register("set_teams",            m.set_teams)
+    ctx.register("context_reset",        m.context_reset)
     ctx.register("overlay_on",           m.overlay_on)
     ctx.register("key_down",             m.key_down)
 end
