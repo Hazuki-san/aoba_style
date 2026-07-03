@@ -155,7 +155,7 @@ local REDIRECTS = {
     {"dribble","dribble_pregate",9},
 }
 
--- byte patches (engine fixes + GK save quality).  {feature, addr, verify-old, new}
+-- 1.01.00 bytes patch. {feature, addr, verify-old, new}
 local BYTEFIXES = {
     {"fixes",      0x142613D3C, "\x13\x01\x00\x00", "\x13\x03\x00\x00"},                                   -- SS Hole Player @ SS
     {"fixes",      0x141FC09D0, "\xBA\x02\x00\x00\x00\x83\xF9\x05",
@@ -179,7 +179,7 @@ local BYTEFIXES = {
     {"goalkeeper", 0x1407521E8, "\x28", "\x41"},                                                           -- GK save qual floor 40 -> 65
 }
 
--- 1.07.02 byte patches (resolved from the steam IDB).
+-- 1.07.02  bytes patch. {feature, addr, verify-old, new}
 local BYTEFIXES_107 = {
     {"fixes",      0x14261CE1C, "\x13\x01\x00\x00", "\x13\x03\x00\x00"},                                   -- SS Hole Player @ SS
     {"fixes",      0x141FC9800, "\xBA\x02\x00\x00\x00\x83\xF9\x05",
@@ -247,6 +247,18 @@ local DEFAULT_ON = {
     fixes=true, referee=true,
 }
 
+-- fixed feature order -> bitmask, stamped beside the cave tag so we only reuse a
+-- block when the enabled-feature set is identical (cave layout matches).
+local FEATURES = {
+    "dribble","first_touch","second_touch","pressing","defensive","goalkeeper",
+    "ball_physics","reaction","early_cross","fk_walljump","fixes","referee",
+}
+local function feat_mask(on)
+    local mask = 0
+    for i, k in ipairs(FEATURES) do if on[k] then mask = mask + 2 ^ (i - 1) end end
+    return math.floor(mask)
+end
+
 local function u64(v) return memory.pack("u64", v) end
 local function i32(v) return memory.pack("i32", v) end
 local function f32(v) return memory.pack("f", v) end
@@ -264,6 +276,32 @@ local function alloc_near(target, size)
             end
         end
     end
+end
+
+-- Recover a cave block left by a previous install so a live-reload patches it in
+-- place instead of leaking a fresh VirtualAlloc each time. The displacement
+-- redirects all point into db (= block) at fixed offsets, so any applied one
+-- reveals the base; we require several to agree, a 64K-aligned base within the
+-- alloc window, and a magic tag before trusting it (so a clean game never matches).
+local function recover_block(ver, OFF, on)
+    local counts = {}
+    for i, r in ipairs(REDIRECTS) do
+        local site, len = ver.rd[i], r[3]
+        if site then
+            local cand = memory.unpack("i32", memory.read(site + len - 4, 4)) + (site + len) - OFF[r[2]]
+            if cand > 0 then counts[cand] = (counts[cand] or 0) + 1 end
+        end
+    end
+    local best, bestn = 0, 0
+    for c, n in pairs(counts) do if n > bestn then best, bestn = c, n end end
+    if bestn >= 3 and best % 0x10000 == 0 then
+        local d = best - ver.hook_dribgate
+        if d > -0x20000000 and d < 0x20000000 and memory.read(best + 0x3F8, 8) == "AOBALOVE"
+           and memory.unpack("i32", memory.read(best + 0x3F0, 4)) == feat_mask(on) then
+            return best
+        end
+    end
+    return nil
 end
 
 local function load_ini(ctx)
@@ -726,21 +764,37 @@ function m.init(ctx)
         on[k] = (ini["feature_"..k] == nil) and d or (ini["feature_"..k] == "1")
     end
 
-    local block = alloc_near(ver.hook_dribgate, 0x3000)
-    if not block then log("[aoba] VirtualAlloc failed"); return end
-    local db, code = block, block + 0x400
-
-    -- data slots: defaults + ini overrides, then the fixed popcount LUT
+    -- data-block layout (offsets only; independent of the block address)
     local OFF, off = {}, 0
     for _, d in ipairs(DATA) do
         OFF[d[1]] = off
+        off = off + (d[2] == "b" and 1 or 4)
+    end
+    OFF.popcount_lut = off
+
+    -- reuse the cave from a prior install across live-reloads (no leak); else alloc
+    local reused = recover_block(ver, OFF, on)
+    local block = reused or alloc_near(ver.hook_dribgate, 0x3000)
+    if not block then log("[aoba] VirtualAlloc failed"); return end
+    local db, code = block, block + 0x400
+
+    -- data slots: defaults + ini overrides, then the fixed popcount LUT + reuse tag
+    off = 0
+    for _, d in ipairs(DATA) do
         local v = ini[d[1]] and tonumber(ini[d[1]]) or d[3]
         if d[2] == "b" then memory.write(db + off, memory.pack("u8", math.floor(v))); off = off + 1
         else memory.write(db + off, f32(v)); off = off + 4 end
     end
-    OFF.popcount_lut = off; memory.write(db + off, POPCOUNT); off = off + #POPCOUNT
+    memory.write(db + OFF.popcount_lut, POPCOUNT)
+    memory.write(db + 0x3F0, i32(feat_mask(on)))   -- feature mask (reuse guard)
+    memory.write(db + 0x3F8, "AOBALOVE")            -- cave tag
 
-    -- caves + hooks
+    -- caves + hooks.
+    -- NOTE: Sider's Shift+R reload re-runs init and rewrites these sites/caves via
+    -- memory.write (VirtualProtect + non-atomic memcpy) from the Present thread, with
+    -- no game-thread suspension. Safe at startup and from a menu / pre-kickoff;
+    -- reloading while the ball is live risks a torn write over executing code.
+    -- Reuse only rewrites in place when the feature mask matches.
     local cptr = code
     for _, c in ipairs(CAVES) do
         if on[c.f] and ver[c.h] then
@@ -754,32 +808,19 @@ function m.init(ctx)
         end
     end
 
-    -- referee: skip silently if referee_strictness.lua already patched the game
-    local referee_installed = false
+    -- referee
     local gft = (vname == "1.07.02") and "\xE9\xEB\xE8\xA3\x03" or "\xE9\x7B\x04\x9F\x03"
-    if on.referee and not memory.search_process(gft) then
-        log("[aoba] GetFoulThresholds thunk redirected (referee_strictness.lua) - skipping referee")
+    local thunk_addr = memory.search_process(gft)
+    if on.referee and not thunk_addr then
+        log("[aoba] GetFoulThresholds thunk already redirected - skipping referee")
     elseif on.referee then
-        local function place(bytes)
-            local at = cptr
-            memory.write(at, bytes)
-            cptr = at + #bytes; cptr = cptr + (16 - cptr % 16)
-            return at
-        end
-        local gf = place(build_foulthresh(ver, cptr, db, OFF))
-        local ss = place(build_score2severity(ver, cptr, db, OFF, gf))
-        local rg = place(build_refgates(ver, cptr, db, OFF))
-        for _, site in ipairs({ ver.s2s_a, ver.s2s_b }) do
-            if memory.read(site, 1) == "\xE8" then
-                memory.write(site + 1, i32(ss - (site + 5)))
-                log(string.format("[aoba] hook  %-13s %-18s %s", "referee", "score2severity", hex(site)))
-            end
-        end
-        if memory.read(ver.hook_refgates, 4) == "\xF7\x44\x24\x60" then
-            memory.write(ver.hook_refgates, "\xE9" .. i32(rg - (ver.hook_refgates + 5)) .. "\x90\x90\x90")
-            log(string.format("[aoba] hook  %-13s %-18s %s", "referee", "hook_refgates", hex(ver.hook_refgates)))
-        end
-        referee_installed = true
+        local bytes = build_foulthresh(ver, cptr, db, OFF)
+        memory.write(cptr, bytes)
+        local thunk_num = ptr(thunk_addr)
+        memory.write(thunk_addr, "\xE9" .. i32(cptr - (thunk_num + 5)))
+        log(string.format("[aoba] hook  %-13s %-18s %s", "referee", "GetFoulThresh", hex(thunk_addr)))
+        cptr = cptr + #bytes
+        cptr = cptr + (16 - cptr % 16)
     end
 
     -- displacement redirects
@@ -807,7 +848,7 @@ function m.init(ctx)
     local off_l = {}
     for _, k in ipairs(order) do if not on[k] then off_l[#off_l+1] = k end end
     if #off_l > 0 then log("[aoba] disabled: " .. table.concat(off_l, ", ")) end
-    log(string.format("[aoba] %s ready - cave @ %s, %d bytes", vname, hex(block), cptr - code))
+    log(string.format("[aoba] %s ready - cave @ %s (%s), %d bytes", vname, hex(block), reused and "reused" or "new", cptr - code))
 end
 
 return m
