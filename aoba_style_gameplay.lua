@@ -66,7 +66,6 @@ local VERSIONS = {
         hook_stub_timer     = 0x14212EA46, ret_stub_timer      = 0x14212EA4E,
         hook_stub_corridor  = 0x14212EAA7, ret_stub_corridor   = 0x14212EAAF,
         hook_teammate       = 0x14212EBCC, ret_teammate_reject = 0x14212EBE0, ret_teammate_skip = 0x14212EBD1,
-        hook_secondary      = 0x14212F2B6, ret_sec_cond2       = 0x14212F2BC, ret_sec_pass = 0x14212F2DC, ret_sec_fail = 0x14212F314,
         hook_ballctrl       = 0x140862762, ret_ballctrl        = 0x140862767,
         hook_secondtouch    = 0x1407C2F84, ret_secondtouch     = 0x1407C2F8C,
         hook_earlycross     = 0x14063AE4E, ret_earlycross      = 0x14063AE53,
@@ -74,7 +73,6 @@ local VERSIONS = {
         hook_wall0          = 0x14074011D, ret_wall0           = 0x140740690,
         hook_wall2          = 0x140740772, ret_wall2           = 0x1407407C4,
         hook_refgates       = 0x1405B7D14, ret_refgates        = 0x1405B7DDB,
-        s2s_a               = 0x1405B7875, s2s_b               = 0x1405B78E4,
 
         rd = {
             0x140633E49, 0x140633E5A, 0x140633E6B, 0x140633E7A, 0x140633FB9, 0x140633FDF, 0x140633FE9,
@@ -114,7 +112,6 @@ local VERSIONS = {
         hook_stub_timer     = 0x1421370D6, ret_stub_timer      = 0x1421370DE,
         hook_stub_corridor  = 0x142137137, ret_stub_corridor   = 0x14213713F,
         hook_teammate       = 0x14213725C, ret_teammate_reject = 0x142137270, ret_teammate_skip = 0x142137261,
-        hook_secondary      = 0x142137946, ret_sec_cond2       = 0x14213794C, ret_sec_pass = 0x14213796C, ret_sec_fail = 0x1421379A4,
         hook_ballctrl       = 0x1408630B2, ret_ballctrl        = 0x1408630B7,
         hook_secondtouch    = 0x1407C3824, ret_secondtouch     = 0x1407C382C,
         hook_earlycross     = 0x14063B7DE, ret_earlycross      = 0x14063B7E3,
@@ -122,7 +119,6 @@ local VERSIONS = {
         hook_wall0          = 0x140740A0D, ret_wall0           = 0x140740F80,
         hook_wall2          = 0x140741062, ret_wall2           = 0x1407410B4,
         hook_refgates       = 0x1405B8724, ret_refgates        = 0x1405B87EB,
-        s2s_a               = 0x1405B8285, s2s_b               = 0x1405B82F4,
 
         rd = {
             0x1406347D9,0x1406347EA,0x1406347FB,0x14063480A,0x140634949,0x14063496F,0x140634979,
@@ -218,7 +214,6 @@ local DATA = {
     {"bp_collision_scale","f",1.0},{"bp_pass_base","f",101.5},{"bp_pass_fk","f",103.0},
     {"dribble_pregate","f",35.0},
     {"dribble_min_dist","f",2.5},{"const_15","f",15.0},{"dribble_cone_limit","f",90.0},
-    {"sec_engage_mul","f",20.0},{"sec_base_angle","f",35.0},
     {"bc_zero","f",0.0},{"bc_scale","f",0.007},{"bc_one","f",1.0},{"bc_floor","f",0.55},
     {"bc_abs_min","f",0.50},{"bc_cap_base","f",2.5},{"bc_cap_scale","f",0.013},
     {"st_half","f",0.5},{"st_pivot","f",40.0},{"st_span","f",60.0},
@@ -481,24 +476,6 @@ local function build_teammate(ver, at, db, OFF)
     return a:build()
 end
 
-local function build_secondary(ver, at, db, OFF)
-    local a = asm(at)
-    a:e("\x44\x0F\x2F\xC2")                             -- comiss xmm8,xmm2  (30deg vs |team_facing|)
-    a:j("\x76","try")                                   -- jbe try
-    a:jmp(ver.ret_sec_cond2)                            -- passes -> normal flow
-    a:L("try")
-    a:e("\x48\x83\xEC\x20\x0F\x28\xC6\x0F\x28\xCF")     -- sub rsp,20h; movaps xmm0,xmm6; movaps xmm1,xmm7
-    a:call(ver.ShortestAngle)
-    a:e("\x66\x0F\x7E\xC0\x25\xFF\xFF\xFF\x7F\x66\x0F\x6E\xD0\x48\x83\xC4\x20") -- |player_facing|; add rsp,20h
-    a:e("\xF3\x0F\x10\x85\x50\x01\x00\x00")             -- movss xmm0,[rbp+150h]  ; a5 urgency
-    a:rip("\xF3\x0F\x59\x05", db + OFF.sec_engage_mul)  -- mulss xmm0,[20]
-    a:rip("\xF3\x0F\x58\x05", db + OFF.sec_base_angle)  -- addss xmm0,[35]
-    a:e("\x0F\x2F\xC2")                                 -- comiss xmm0,xmm2
-    a:jcc32("\x0F\x87", ver.ret_sec_pass)               -- ja  -> skip cond1+2 -> cond3+4
-    a:jmp(ver.ret_sec_fail)                             -- jmp -> pass branch
-    return a:build()
-end
-
 -- ===== first touch / ball control =====
 local function build_ballctrl(ver, at, db, OFF)
     local a = asm(at)
@@ -666,21 +643,6 @@ local function build_foulthresh(ver, at, db, OFF)
     return a:build()
 end
 
-local function build_score2severity(ver, at, db, OFF, gf)
-    local a = asm(at)
-    a:e("\x53\x48\x83\xEC\x20\x0F\xB6\xDA")               -- push rbx; sub rsp,20h; movzx ebx,dl (score)
-    a:e("\x66\xC7\x44\x24\x38\x00\x00\x48\x8D\x54\x24\x38\xC6\x44\x24\x3A\x00") -- buf; lea rdx,[rsp+38h]
-    a:call(gf)                                            -- cave_GetFoulThresh
-    a:e("\x0F\xB6\x4C\x24\x38\x38\xD9"); a:j("\x76","t2") -- movzx ecx,[rsp+38h](T1); cmp cl,bl; jbe check_t2
-    a:e("\x31\xC0\x48\x83\xC4\x20\x5B\xC3")               -- severity 0
-    a:L("t2")
-    a:e("\x0F\xB6\x44\x24\x39\x38\xD8"); a:j("\x76","hi") -- movzx eax,[rsp+39h](T2); cmp al,bl; jbe high
-    a:e("\x28\xC8\x0F\xB6\xD0\xD1\xEA\x0F\xB6\xC1\x01\xC2\x0F\xB6\xCB\x31\xC0\x39\xCA\x0F\x92\xC0\xFF\xC0\x48\x83\xC4\x20\x5B\xC3") -- mid; sev 1/2
-    a:L("hi")
-    a:e("\x3A\x5C\x24\x3A\x19\xC0\x83\xC0\x04\x48\x83\xC4\x20\x5B\xC3") -- cmp bl,T3; sev 3/4
-    return a:build()
-end
-
 local function build_refgates(ver, at, db, OFF)
     local a = asm(at)
     -- Gate 0: DOGSO block
@@ -735,13 +697,13 @@ local CAVES = {
     { f="dribble",     b=build_stub_timer,    h="hook_stub_timer",    pad=3 },
     { f="dribble",     b=build_stub_corridor, h="hook_stub_corridor", pad=3 },
     { f="dribble",     b=build_teammate,      h="hook_teammate",      pad=0 },
-    { f="dribble",     b=build_secondary,     h="hook_secondary",     pad=1 },
     { f="first_touch", b=build_ballctrl,      h="hook_ballctrl",      pad=0 },
     { f="second_touch",b=build_secondtouch,   h="hook_secondtouch",   pad=3 },
     { f="early_cross", b=build_earlycross,    h="hook_earlycross",    pad=0 },
     { f="goalkeeper",  b=build_gkreact,       h="hook_gkreact",       pad=3 },
     { f="fk_walljump", b=build_wall0,         h="hook_wall0",         pad=0 },
     { f="fk_walljump", b=build_wall2,         h="hook_wall2",         pad=0 },
+    { f="referee",     b=build_refgates,      h="hook_refgates",      pad=2 },
 }
 
 function m.init(ctx)
