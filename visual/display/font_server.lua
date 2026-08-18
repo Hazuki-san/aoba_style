@@ -27,10 +27,13 @@ Violation of these terms constitutes copyright infringement.
 --]]
 
 -- Pack layout:
---   sider/content/font-server/<Pack>/common/menu/font/pes_fnt.bin
---   sider/content/font-server/<Pack>/<locale>/menu/font/pes_fnt.bin
---   sider/content/font-server/<Pack>/4k/common/menu/font/pes_fnt.bin   (4K override)
---   sider/content/font-server/<Pack>/4k/<locale>/menu/font/pes_fnt.bin  (4K override)
+--   sider/content/font-server/<Pack>/common/menu/font/<name>_fnt.bin
+--   sider/content/font-server/<Pack>/<locale>/menu/font/<name>_fnt.bin
+--   sider/content/font-server/<Pack>/4k/common/menu/font/<name>_fnt.bin    (4K override)
+--   sider/content/font-server/<Pack>/4k/<locale>/menu/font/<name>_fnt.bin  (4K override)
+--
+-- Replaceable <name>s: see FONT_ID_FILE. <locale>: see LOCALE_CODES.
+-- A locale file takes priority over the common one for the same font.
 --
 -- map.txt: <tournament_id>, <pack_name>
 
@@ -38,23 +41,18 @@ local m = {}
 
 if ffi ~= nil then
     ffi.cdef[[
-    typedef void* LPVOID;
-    typedef uint64_t SIZE_T;
-    typedef uint32_t DWORD;
-    typedef uint8_t BYTE;
     void* VirtualAlloc(void* lpAddress, uint64_t dwSize, uint32_t flAllocationType, uint32_t flProtect);
     ]]
 end
 
 
-local CONTENT_ROOT = ".\\content\\font-server"
+local CONTENT_ROOT = "content\\font-server"
 local MAP_FILE     = CONTENT_ROOT .. "\\map.txt"
 
 -- Per-version address tables
 local VERSIONS = {
     { -- 1.01.00
         tid_setter         = 0x1414C1BE0,
-        font_ready         = 0x140E60350,
         glyph_cache        = 0x1436F95F8,
         mem_free           = 0x140227930,
         font_replace       = 0x140E2D270,
@@ -66,7 +64,6 @@ local VERSIONS = {
     },
     { -- 1.07.02
         tid_setter         = 0x1414C76F0,
-        font_ready         = 0x140E62360,
         glyph_cache        = 0x143707A18,
         mem_free           = 0x140227A90,
         font_replace       = 0x140E2F620,
@@ -93,7 +90,12 @@ local ALL_FONT_IDS = {
     41                      -- XLPsm
 }
 
-local GLYPH_STRIDE  = 72
+local GLYPH_LISTS   = 3
+local GLYPH_LIST_SZ = 24
+local GLYPH_STRIDE  = GLYPH_LISTS * GLYPH_LIST_SZ
+local GLYPH_NEXT    = 8
+local GLYPH_KEY     = 36
+local GLYPH_FLAG    = 16
 
 local addr = {}
 
@@ -110,13 +112,18 @@ local manual_override  = false
 local use_matchMenu    = true
 local is_4k            = false
 local no_4k_scale      = false
+local version_ok       = false
 
 local function trim(s) return s:match("^%s*(.-)%s*$") end
 local function exists(p) local f = io.open(p,"rb"); if f then f:close(); return true end; return false end
 local function absp(rel) return sider_dir .. rel:gsub("/","\\") end
 local function ptr_to_num(p) return tonumber(ffi.cast("uint64_t", p)) end
 local function read_ptr(a) return tonumber(memory.unpack("u64", memory.read(a, 8))) end
-local function write_ptr(a, v) memory.write(a, memory.pack("u64", v)) end
+
+-- a: address of an E9 rel32 jmp; returns its destination
+local function jmp_target(a)
+    return a + 5 + tonumber(memory.unpack("i32", memory.read(a + 1, 4)))
+end
 
 local function alloc_near(target, size)
     local GRAN = 0x10000
@@ -127,7 +134,7 @@ local function alloc_near(target, size)
             local a = base + off
             if a > 0 then
                 local p = ffi.C.VirtualAlloc(ffi.cast("void*",ffi.cast("uint64_t",a)), size, 0x3000, 0x40)
-                if p ~= nil and ptr_to_num(p) ~= 0 then return p end
+                if p ~= nil then return p end 
             end
         end
     end
@@ -141,15 +148,15 @@ local LOCALE_CODES = {
 }
 local active_locale = nil
 
+-- returns an existing path or nil
 local function pack_font_path(pack, subdir, fname)
-    if subdir == "xxx" and active_locale then
-        subdir = active_locale
-    end
     if is_4k and not no_4k_scale then
-        local path_4k = absp(string.format("%s\\%s\\4k\\%s\\menu\\font\\%s", CONTENT_ROOT, pack, subdir, fname))
-        if exists(path_4k) then return path_4k end
+        local p4 = absp(string.format("%s\\%s\\4k\\%s\\menu\\font\\%s", CONTENT_ROOT, pack, subdir, fname))
+        if exists(p4) then return p4 end
     end
-    return absp(string.format("%s\\%s\\%s\\menu\\font\\%s", CONTENT_ROOT, pack, subdir, fname))
+    local p = absp(string.format("%s\\%s\\%s\\menu\\font\\%s", CONTENT_ROOT, pack, subdir, fname))
+    if exists(p) then return p end
+    return nil
 end
 
 local function read_file(path)
@@ -162,11 +169,13 @@ end
 
 local function extract_wfnt(path)
     local raw = read_file(path)
-    if not raw or #raw < 4 then return nil end
-    local data, err = zlib.unpack(raw)
-    if not data then return nil end
-    local pos = data:find("WFNT")
-    if not pos then return nil end
+    if not raw then return nil end
+    local data = zlib.unpack(raw) or raw
+    local pos = data:find("WFNT", 1, true)
+    if not pos then
+        log(string.format("[FontServer] no WFNT header in %s", path))
+        return nil
+    end
     return data:sub(pos)
 end
 
@@ -205,17 +214,17 @@ local function load_map()
     log(string.format("[FontServer] %d pack(s): %s", #all_packs, table.concat(all_packs, ", ")))
 end
 
-local function load_config(ctx)
+local function load_config()
     local t = {}
-    for _, dir in ipairs({ctx.sider_dir, ctx.sider_dir .. "\\modules"}) do
-        local path = dir .. "\\font_server.ini"
+    for _, rel in ipairs({"font_server.ini", "modules\\font_server.ini"}) do
+        local path = sider_dir .. rel
         local f = io.open(path, "r")
         if f then
             log(string.format("[FontServer] config: %s", path))
             for line in f:lines() do
                 line = line:gsub("^[\xEF\xBB\xBF]+", "")
                 line = line:gsub("^[%s%z\xA0]+", ""):gsub("[%s%z\xA0]+$", "")
-                local k, v = line:match("^([%w_]+)%s*=%s*([-%w%d.]+)")
+                local k, v = line:match("^([%w_]+)%s*=%s*([-%w.]+)")
                 if k and v then t[k] = v end
             end
             f:close()
@@ -231,31 +240,59 @@ end
 local mem_free_fn = nil
 
 local function flush_glyph_cache()
+    if not addr.glyph_cache then return end
     local cache_ptr = read_ptr(addr.glyph_cache)
     if cache_ptr == 0 then return end
     local bucket_base = read_ptr(cache_ptr)
     if bucket_base == 0 then return end
+    local dead = memory.pack("i32", -1)
     for _, id in ipairs(ALL_FONT_IDS) do
-        write_ptr(bucket_base + id * GLYPH_STRIDE, 0)
+        for sub = 0, GLYPH_LISTS - 1 do
+            local hdr = bucket_base + id * GLYPH_STRIDE + sub * GLYPH_LIST_SZ
+            local node, guard = read_ptr(hdr), 0
+            while node ~= 0 and guard < 65536 do
+                memory.write(node + GLYPH_KEY, dead)
+                node = read_ptr(node + GLYPH_NEXT)
+                guard = guard + 1
+            end
+            memory.write(hdr + GLYPH_FLAG, "\x01")
+        end
     end
 end
 
+-- UCL/UEL/USC variants (13-15, 22-24, 30-32, 34-36, 38-40) are picked by the tournament type.
+-- This *should* be unused in PES 2021, because the license is already expired in PES 2018.
+-- Feel free to uncomment if you want to test something out or trying to be scientist, lol.
 local FONT_ID_FILE = {
     [1]  = "ext_fnt.bin",
     [12] = "pes_fnt.bin",
+    -- [13] = "pes_fnt.bin", -- UCL
+    -- [14] = "pes_fnt.bin", -- UEL
+    -- [15] = "pes_fnt.bin", -- USC
     [18] = "matchBold_fnt.bin",
     [20] = "plname_fnt.bin",
     [21] = "LPsm_fnt.bin",
+    -- [22] = "LPsm_fnt.bin", -- UCL
+    -- [23] = "LPsm_fnt.bin", -- UEL
+    -- [24] = "LPsm_fnt.bin", -- USC
     [25] = "numMid_fnt.bin",
     [26] = "numExt_fnt.bin",
     [27] = "numSml_fnt.bin",
     [28] = "numCard_fnt.bin",
     [29] = "numXl_fnt.bin",
+    -- [30] = "matchBold_fnt.bin", -- UCL
+    -- [31] = "matchBold_fnt.bin", -- UEL
+    -- [32] = "matchBold_fnt.bin", -- USC
     [33] = "numMatch_fnt.bin",
+    -- [34] = "numMatch_fnt.bin", -- UCL
+    -- [35] = "numMatch_fnt.bin", -- UEL
+    -- [36] = "numMatch_fnt.bin", -- USC
     [37] = "match_fnt.bin",
+    -- [38] = "match_fnt.bin", -- UCL
+    -- [39] = "match_fnt.bin", -- UEL
+    -- [40] = "match_fnt.bin", -- USC
     [41] = "XLPsm_fnt.bin",
 }
-local FONT_SUBDIRS = { "common", "xxx" }
 local font_replace_fn = nil
 local font_resolve_fn = nil
 local original_wfnt   = {}
@@ -269,70 +306,64 @@ local function save_original(id, obj_num)
     end
 end
 
+local function free_bufs(old_bufs)
+    if not mem_free_fn then return end
+    for buf in pairs(old_bufs) do
+        mem_free_fn(ffi.cast("void*", ffi.cast("uint64_t", buf)), 0)
+    end
+end
+
 local function do_font_switch(pack)
-    if not font_replace_fn or not font_resolve_fn then return end
+    if not (font_replace_fn and font_resolve_fn) then return end
     local replaced = 0
     local old_bufs = {}
-    local file_cache = {}
-    for _, subdir in ipairs(FONT_SUBDIRS) do
-        for _, id in ipairs(ALL_FONT_IDS) do
-            local fname = FONT_ID_FILE[id]
-            if fname then
-                local cache_key = subdir .. "/" .. fname
-                local path = pack_font_path(pack, subdir, fname)
-                if exists(path) then
-                    if not file_cache[cache_key] then
-                        file_cache[cache_key] = extract_wfnt(path)
-                    end
-                    local wfnt = file_cache[cache_key]
-                    if wfnt then
-                        local obj = font_resolve_fn(id)
-                        local obj_num = tonumber(ffi.cast("uint64_t", obj))
-                        if obj_num ~= 0 then
-                            save_original(id, obj_num)
-                            local old_buf = read_ptr(obj_num + 80)
-                            font_replace_fn(obj, wfnt, #wfnt)
-                            if old_buf ~= 0 then
-                                old_bufs[old_buf] = true
-                            end
-                            replaced = replaced + 1
-                        end
+    for _, id in ipairs(ALL_FONT_IDS) do
+        local fname = FONT_ID_FILE[id]
+        if fname then
+            -- locale file wins over common
+            local path = active_locale and pack_font_path(pack, active_locale, fname) or nil
+            path = path or pack_font_path(pack, "common", fname)
+            if path then
+                local wfnt = extract_wfnt(path)
+                if wfnt then
+                    local obj = font_resolve_fn(id)
+                    if obj ~= nil then
+                        local obj_num = ptr_to_num(obj)
+                        save_original(id, obj_num)
+                        local old_buf = read_ptr(obj_num + 80)
+                        font_replace_fn(obj, wfnt, #wfnt)
+                        if old_buf ~= 0 then old_bufs[old_buf] = true end
+                        replaced = replaced + 1
                     end
                 end
             end
         end
     end
     flush_glyph_cache()
-    if mem_free_fn then
-        for buf, _ in pairs(old_bufs) do
-            mem_free_fn(ffi.cast("void*", ffi.cast("uint64_t", buf)), 0)
-        end
+    free_bufs(old_bufs)
+    if replaced == 0 then
+        log(string.format("[FontServer] WARNING: pack '%s' has no usable font files", pack))
+    else
+        log(string.format("[FontServer] -> '%s' (%d fonts replaced)", pack, replaced))
     end
-    log(string.format("[FontServer] -> '%s' (%d fonts replaced)", pack, replaced))
 end
 
 local function do_font_restore()
-    if not font_replace_fn or not font_resolve_fn then return end
+    if not (font_replace_fn and font_resolve_fn) then return end
     local restored = 0
     local old_bufs = {}
     for id, wfnt in pairs(original_wfnt) do
         local obj = font_resolve_fn(id)
-        local obj_num = tonumber(ffi.cast("uint64_t", obj))
-        if obj_num ~= 0 then
+        if obj ~= nil then
+            local obj_num = ptr_to_num(obj)
             local old_buf = read_ptr(obj_num + 80)
             font_replace_fn(obj, wfnt, #wfnt)
-            if old_buf ~= 0 then
-                old_bufs[old_buf] = true
-            end
+            if old_buf ~= 0 then old_bufs[old_buf] = true end
             restored = restored + 1
         end
     end
     flush_glyph_cache()
-    if mem_free_fn then
-        for buf, _ in pairs(old_bufs) do
-            mem_free_fn(ffi.cast("void*", ffi.cast("uint64_t", buf)), 0)
-        end
-    end
+    free_bufs(old_bufs)
     log(string.format("[FontServer] restored %d fonts to default", restored))
 end
 
@@ -340,23 +371,22 @@ end
 
 local function setup()
     if ffi == nil then
-        error("[FontServer] requires ffi: set luajit.ext.enabled = 1")
+        log("[FontServer] requires ffi: set luajit.ext.enabled = 1")
+        return false
     end
 
-    local TID_SIG   = "\x66\x89\x51\x0A\xC3"
-    local READY_SIG = "\x48\x89\x5C\x24\x08\x57\x48\x83"
-    local ver
-    for _, v in ipairs(VERSIONS) do
-        if memory.read(v.tid_setter, 5) == TID_SIG
-           and memory.read(v.font_ready, 8) == READY_SIG then
-            ver = v; break
-        end
+    local ver, vname
+    if     memory.search_process("\xE9\x2B\xAC\x56\x03") then ver, vname = VERSIONS[1], "1.01.00"
+    elseif memory.search_process("\xE9\x4B\x9E\x4E\x03") then ver, vname = VERSIONS[2], "1.07.02"
+    else
+        log("[FontServer] ERROR: unsupported game version")
+        return false
     end
-    if not ver then log("[FontServer] version not detected"); return end
+    log(string.format("[FontServer] version %s", vname))
 
     addr.glyph_cache = ver.glyph_cache
 
-    -- resolve font ID -> filename mapping
+    -- detect active locale (font dirs are per-language)
     if ver.lang_id then
         local lang_idx = tonumber(memory.unpack("u32", memory.read(ver.lang_id, 4)))
         if lang_idx and lang_idx < #LOCALE_CODES then
@@ -364,9 +394,14 @@ local function setup()
             log(string.format("[FontServer] locale: %s", active_locale))
         end
     end
+    if not active_locale then
+        log("[FontServer] WARNING: locale not detected; locale fonts will be skipped")
+    end
 
-    mem_free_fn = ffi.cast("void (*)(void*, unsigned int)",
-        ffi.cast("void*", ffi.cast("uint64_t", ver.mem_free)))
+    if ver.mem_free then
+        mem_free_fn = ffi.cast("void (*)(void*, unsigned int)",
+            ffi.cast("void*", ffi.cast("uint64_t", ver.mem_free)))
+    end
     if ver.font_replace then
         font_replace_fn = ffi.cast("int (*)(void*, const char*, unsigned int)",
             ffi.cast("void*", ffi.cast("uint64_t", ver.font_replace)))
@@ -379,7 +414,7 @@ local function setup()
     if ver.is_4k_check then
         local check_fn = ffi.cast("bool (*)()",
             ffi.cast("void*", ffi.cast("uint64_t", ver.is_4k_check)))
-        is_4k = check_fn() ~= 0
+        is_4k = check_fn()  -- bool return arrives as a lua boolean
         if is_4k and no_4k_scale then
             -- patch is_4k_check to always return false and clear fonts
             memory.write(ver.is_4k_check, "\x31\xC0\xC3")
@@ -390,56 +425,9 @@ local function setup()
         end
     end
 
-    log("[FontServer] version matched")
-
     -- helpers
     local p64 = function(a) return memory.pack("u64", a) end
     local p32 = function(a) return memory.pack("i32", a) end
-
-    -- gmc hooks
-    if ver.gmc_create_ret and ver.gmc_destroy_ret then
-        local cave_ptr = alloc_near(ffi.cast("void*",ffi.cast("uint64_t", ver.gmc_create_ret)), 128)
-        if not cave_ptr then
-            log("[FontServer] gmc hooks: VirtualAlloc failed")
-        else
-            local cave = ptr_to_num(cave_ptr)
-            addr.reapply_flag = cave + 64
-            addr.restore_flag = cave + 65
-            memory.write(addr.reapply_flag, "\x00")
-            memory.write(addr.restore_flag, "\x00")
-
-            -- Hook gmc_destroy_ret
-            local hook_destroy = table.concat({
-                "\x50",                              -- push rax
-                "\x48\xB8", p64(addr.restore_flag),  -- movabs rax, restore_flag
-                "\xC6\x00\x01",                      -- mov byte [rax], 1
-                "\x58",                              -- pop rax
-                "\x48\x83\xC4\x28",                  -- add rsp, 28h
-                "\xC3"                               -- retn
-            })
-            memory.write(cave, hook_destroy)
-            memory.write(ver.gmc_destroy_ret, "\xE9" .. p32(cave - (ver.gmc_destroy_ret + 5)))
-
-            -- Hook gmc_create_ret
-            local cave2 = cave + 32
-            local hook_create = table.concat({
-                "\x50",                              -- push rax
-                "\x48\xB8", p64(addr.reapply_flag),  -- movabs rax, reapply_flag
-                "\xC6\x00\x01",                      -- mov byte [rax], 1
-                "\x58",                              -- pop rax
-                "\x48\x81\xC4\x90\x00\x00\x00",      -- add rsp, 90h
-                "\x5F",                              -- pop rdi
-                "\x5E",                              -- pop rsi
-                "\x5D",                              -- pop rbp
-                "\xC3"                               -- retn
-            })
-            memory.write(cave2, hook_create)
-            memory.write(ver.gmc_create_ret, "\xE9" .. p32(cave2 - (ver.gmc_create_ret + 5)) .. "\x90\x90")
-
-            log(string.format("[FontServer] gmc hooks: cave=0x%X create=0x%X destroy=0x%X",
-                cave, ver.gmc_create_ret, ver.gmc_destroy_ret))
-        end
-    end
 
     -- tid hook
 
@@ -452,8 +440,6 @@ local function setup()
 
     local tid_code = table.concat({
         "\x66\x89\x51\x0A",         -- mov [rcx+0xA], dx
-        "\x66\x81\xFA\xFF\xFF",     -- cmp dx, 65535
-        "\x74\x0D",                 -- if == 65535 then retn
         "\x48\xB8", p64(tid_addr),  -- movabs rax, sider_tid
         "\x66\x89\x10",             -- mov [rax], dx
         "\xC3",                     -- retn
@@ -464,6 +450,78 @@ local function setup()
 
     memory.write(ver.tid_setter, "\xE9" .. p32(cave - (ver.tid_setter + 5)))
     log(string.format("[FontServer] tid hook: 0x%X", ver.tid_setter))
+
+    -- gmc hooks
+
+    if ver.gmc_create_ret and ver.gmc_destroy_ret then
+        local b_create  = memory.read(ver.gmc_create_ret, 1)
+        local b_destroy = memory.read(ver.gmc_destroy_ret, 1)
+        if b_create == "\xE9" or b_destroy == "\xE9" then
+            local adopted = false
+            if b_create == "\xE9" and b_destroy == "\xE9" then
+                local d  = jmp_target(ver.gmc_destroy_ret)
+                local c2 = jmp_target(ver.gmc_create_ret)
+                if memory.read(d, 3) == "\x50\x48\xB8"
+                   and read_ptr(d + 3) == d + 65 and c2 == d + 32 then
+                    addr.reapply_flag = d + 64
+                    addr.restore_flag = d + 65
+                    adopted = true
+                    log("[FontServer] gmc hooks: adopted existing")
+                end
+            end
+            if not adopted then
+                log("[FontServer] gmc hooks: foreign hook, skipping (no auto apply/restore)")
+            end
+        elseif memory.read(ver.gmc_destroy_ret, 5) ~= "\x48\x83\xC4\x28\xC3"
+            or memory.read(ver.gmc_create_ret, 7) ~= "\x48\x81\xC4\x90\x00\x00\x00" then
+            log("[FontServer] gmc hooks: unexpected bytes at patch site, skipping")
+        else
+            local cave_ptr = alloc_near(ffi.cast("void*",ffi.cast("uint64_t", ver.gmc_create_ret)), 128)
+            if not cave_ptr then
+                log("[FontServer] gmc hooks: VirtualAlloc failed")
+            else
+                local cave = ptr_to_num(cave_ptr)
+                addr.reapply_flag = cave + 64
+                addr.restore_flag = cave + 65
+                memory.write(addr.reapply_flag, "\x00")
+                memory.write(addr.restore_flag, "\x00")
+
+                -- Hook gmc_destroy_ret
+                local hook_destroy = table.concat({
+                    "\x50",                              -- push rax
+                    "\x48\xB8", p64(addr.restore_flag),  -- movabs rax, restore_flag
+                    "\xC6\x00\x01",                      -- mov byte [rax], 1
+                    "\x58",                              -- pop rax
+                    "\x48\x83\xC4\x28",                  -- add rsp, 28h
+                    "\xC3"                               -- retn
+                })
+                memory.write(cave, hook_destroy)
+                memory.write(ver.gmc_destroy_ret, "\xE9" .. p32(cave - (ver.gmc_destroy_ret + 5)))
+
+                -- Hook gmc_create_ret
+                local cave2 = cave + 32
+                local hook_create = table.concat({
+                    "\x50",                              -- push rax
+                    "\x48\xB8", p64(addr.reapply_flag),  -- movabs rax, reapply_flag
+                    "\xC6\x00\x01",                      -- mov byte [rax], 1
+                    "\x58",                              -- pop rax
+                    "\x48\x81\xC4\x90\x00\x00\x00",      -- add rsp, 90h
+                    "\x5F",                              -- pop rdi
+                    "\x5E",                              -- pop rsi
+                    "\x5D",                              -- pop rbp
+                    "\xC3"                               -- retn
+                })
+                memory.write(cave2, hook_create)
+                memory.write(ver.gmc_create_ret, "\xE9" .. p32(cave2 - (ver.gmc_create_ret + 5)) .. "\x90\x90")
+
+                log(string.format("[FontServer] gmc hooks: cave=0x%X create=0x%X destroy=0x%X",
+                    cave, ver.gmc_create_ret, ver.gmc_destroy_ret))
+            end
+        end
+    end
+
+    version_ok = true
+    return true
 end
 
 -- tournament ID
@@ -474,15 +532,26 @@ local function get_tournament_id(ctx)
         if t and t ~= 0 and t ~= 65535 then return t end
     end
     local tid = ctx.tournament_id
-    if tid and tid ~= 65535 then return tid end
+    if tid and tid ~= 0 and tid ~= 65535 then return tid end  -- 0 = unset, both paths
     return nil
 end
 
 -- pack switch
 
 local function do_switch(pack)
-    if pack == active_pack then return end
+    pending_restore = false  -- a selected pack cancels a queued restore
+    if pack == active_pack then
+        pending_pack = nil
+        return
+    end
     pending_pack = pack
+end
+
+local function queue_restore()
+    pending_pack = nil
+    if active_pack then
+        pending_restore = true
+    end
 end
 
 function m.make_key(ctx, filename)
@@ -498,33 +567,33 @@ end
 -- display_frame: deferred switch + reload queue
 
 function m.display_frame(ctx)
-    if addr.reapply_flag then
-        local flag = tonumber(memory.unpack("u8", memory.read(addr.reapply_flag, 1)))
-        if flag ~= 0 then
-            memory.write(addr.reapply_flag, "\x00")
-            if active_pack then
+    if addr.reapply_flag and addr.restore_flag then
+        local reapply = memory.read(addr.reapply_flag, 1) ~= "\x00"
+        local restore = memory.read(addr.restore_flag, 1) ~= "\x00"
+        -- always clear on read, even when the branch below is skipped
+        if reapply then memory.write(addr.reapply_flag, "\x00") end
+        if restore then memory.write(addr.restore_flag, "\x00") end
+
+        if reapply then
+            if pending_pack or pending_restore then
+                -- queued action below supersedes the reapply
+            elseif active_pack then
                 log(string.format("[FontServer] reapplying '%s'", active_pack))
                 do_font_switch(active_pack)
             elseif not manual_override then
                 local tid = get_tournament_id(ctx)
-                if tid then
-                    local pack = t2pack[tid]
-                    if pack then
-                        active_pack = pack
-                        log(string.format("[FontServer] match start -> '%s' (tid=%d)", pack, tid))
-                        do_font_switch(pack)
-                    end
+                local pack = tid and t2pack[tid]
+                if pack then
+                    active_pack = pack
+                    log(string.format("[FontServer] match start -> '%s' (tid=%d)", pack, tid))
+                    do_font_switch(pack)
                 end
             end
-        end
-    end
-
-    if addr.restore_flag then
-        local flag = tonumber(memory.unpack("u8", memory.read(addr.restore_flag, 1)))
-        if flag ~= 0 and active_pack and not manual_override then
-            memory.write(addr.restore_flag, "\x00")
-            log("[FontServer] restoring fonts")
-            pending_restore = true
+        elseif restore then
+            if active_pack and not manual_override then
+                log("[FontServer] restoring fonts")
+                queue_restore()
+            end
         end
     end
 
@@ -545,50 +614,65 @@ end
 -- events
 
 function m.context_reset(ctx)
+    -- tid_addr intentionally not cleared: see trampoline note in setup()
     if active_pack and not manual_override then
-        pending_pack = nil
-        pending_restore = true
+        queue_restore()
     end
 end
 
 function m.overlay_on(ctx)
-    if addr.reapply_flag and addr.restore_flag then
-        ctx.overlay:add_line(string.format("reapply_flag: 0x%X = %d", addr.reapply_flag,
-            tonumber(memory.unpack("u8", memory.read(addr.reapply_flag, 1)))))
-        ctx.overlay:add_line(string.format("restore_flag: 0x%X = %d", addr.restore_flag,
-            tonumber(memory.unpack("u8", memory.read(addr.restore_flag, 1)))))
+    if not version_ok then
+        return "FontServer | INACTIVE (see log)"
     end
-    ctx.overlay:add_line(string.format("active_pack: %s", tostring(active_pack)))
     local tid = get_tournament_id(ctx)
     local label = active_pack or "default"
-    return string.format("FontServer | %s | tid=%s | %s | PgUp/Dn End=auto",
-        label, tostring(tid), manual_override and "manual" or "auto")
+    local lines = {
+        string.format("FontServer | %s | tid=%s | %s | PgUp/PgDn: cycle (manual)  End: auto",
+            label, tostring(tid), manual_override and "manual" or "auto")
+    }
+    --[[
+    if addr.reapply_flag and addr.restore_flag then
+        lines[#lines + 1] = string.format("reapply_flag: 0x%X = %d", addr.reapply_flag,
+            tonumber(memory.unpack("u8", memory.read(addr.reapply_flag, 1))))
+        lines[#lines + 1] = string.format("restore_flag: 0x%X = %d", addr.restore_flag,
+            tonumber(memory.unpack("u8", memory.read(addr.restore_flag, 1))))
+    end
+    lines[#lines + 1] = string.format("active_pack: %s%s", tostring(active_pack),
+        pending_pack and (" (pending: " .. pending_pack .. ")") or "")
+    ]]--
+    return table.concat(lines, "\n")
 end
 
 function m.key_down(ctx, vkey)
     if #all_packs == 0 then return end
-    local cur = active_pack and pack_idx[active_pack] or 0
-    if vkey == 0x21 then
+    -- cycle from the queued selection, not the (possibly stale) applied one
+    local cur
+    if pending_restore then
+        cur = 0
+    elseif pending_pack then
+        cur = pack_idx[pending_pack] or 0
+    else
+        cur = active_pack and pack_idx[active_pack] or 0
+    end
+    if vkey == 0x21 then                    -- PgUp: next pack (manual mode)
         manual_override = true
         local nxt = (cur % (#all_packs + 1)) + 1
         if nxt > #all_packs then
-            pending_pack = nil
-            pending_restore = true
+            queue_restore()
         else
             do_switch(all_packs[nxt])
         end
         return true
-    elseif vkey == 0x22 then
+    elseif vkey == 0x22 then                -- PgDn: previous pack (manual mode)
         manual_override = true
         local prv = ((cur - 2) % (#all_packs + 1)) + 1
         if prv > #all_packs then
-            pending_pack = nil
-            pending_restore = true
+            queue_restore()
         else
             do_switch(all_packs[prv])
         end
         return true
-    elseif vkey == 0x23 then
+    elseif vkey == 0x23 then                -- End: back to auto
         manual_override = false
         return true
     end
@@ -601,14 +685,18 @@ function m.init(ctx)
     end
 
     load_map()
-    load_config(ctx)
-    setup()
+    load_config()
+    local ok = setup()
 
-    ctx.register("livecpk_make_key",     m.make_key)
-    ctx.register("display_frame",        m.display_frame)
-    ctx.register("context_reset",        m.context_reset)
-    ctx.register("overlay_on",           m.overlay_on)
-    ctx.register("key_down",             m.key_down)
+    -- overlay always registered so failures are visible in-game;
+    -- mutating handlers only when hooks are actually installed
+    ctx.register("overlay_on", m.overlay_on)
+    if ok then
+        ctx.register("livecpk_make_key",     m.make_key)
+        ctx.register("display_frame",        m.display_frame)
+        ctx.register("context_reset",        m.context_reset)
+        ctx.register("key_down",             m.key_down)
+    end
 end
 
 return m
